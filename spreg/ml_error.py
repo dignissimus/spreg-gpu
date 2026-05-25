@@ -6,6 +6,9 @@ __author__ = "Luc Anselin luc.anselin@asu.edu,\
               Serge Rey srey@asu.edu, \
               Levi Wolf levi.john.wolf@asu.edu"
 
+import jax
+from jaxopt import LBFGSB
+import jax.numpy as jnp
 import numpy as np
 import numpy.linalg as la
 from scipy import sparse as sp
@@ -17,6 +20,12 @@ from . import regimes as REGI
 from .w_utils import symmetrize
 import pandas as pd
 from .output import output, _nonspat_top
+from scipy.optimize import OptimizeResult
+import cupy as cp
+from cupyx.scipy.sparse import csc_matrix, identity
+import cupyx.scipy.sparse.linalg as cp_splinalg
+from line_profiler import profile
+import cupyx.scipy.sparse as cpsp
 
 try:
     from scipy.optimize import minimize_scalar
@@ -25,9 +34,12 @@ try:
 except ImportError:
     minimize_scalar_available = False
 from .sputils import spdot, spfill_diagonal, spinv
+from .cu_sputils import cuspdot, cuspfill_diagonal
 from libpysal import weights
 
 __all__ = ["ML_Error"]
+
+
 
 
 class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
@@ -159,6 +171,7 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
 
     """
 
+    @profile
     def __init__(self, y, x, w, method="full", epsilon=0.0000001, regimes_att=None):
         # set up main regression variables and spatial filters
         self.y = y
@@ -178,7 +191,8 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
 
         # call minimizer using concentrated log-likelihood to get lambda
         methodML = method.upper()
-        if methodML in ["FULL", "LU", "ORD"]:
+        print("methodML = ", methodML)
+        if methodML in ["FULL", "LU", "ORD", "GPU-ORD", "GPU-GRAD", "GPU-LU"]:
             if methodML == "FULL":
                 W = w.full()[0]  # need dense here
                 res = minimize_scalar(
@@ -188,6 +202,77 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
                     args=(self.n, self.y, ylag, self.x, xlag, W),
                     method="bounded",
                     tol=epsilon,
+                )
+            if methodML == "GPU-GRAD":
+                print("Running JAXopt L-BFGS-B on GPU")
+
+                # TODO: problem with duplicating the full W? If so, just convert W_jax after
+                W = w.full()[0]
+                W_jax = jnp.array(w.full()[0])
+                y_jax = jnp.array(self.y)
+                ylag_jax = jnp.array(ylag)
+                x_jax = jnp.array(self.x)
+                xlag_jax = jnp.array(xlag)
+
+                optimizer = LBFGSB(fun=err_c_loglik_jax)
+
+                init_lam = jnp.array([0.0])
+                bounds = (jnp.array([-0.999]), jnp.array([0.999]))
+
+                best_lam_array, state = optimizer.run(
+                    init_lam,
+                    bounds=bounds,
+                    n=self.n,
+                    y=y_jax,
+                    ylag=ylag_jax,
+                    x=x_jax,
+                    xlag=xlag_jax,
+                    W=W_jax
+                )
+
+                res = OptimizeResult(
+                    x=float(best_lam_array[0]),
+                    fun=float(state.value),
+                    success=True,
+                    message="Optimisation successful via JAXopt."
+                )
+            elif methodML == "GPU-ORD":
+                print("GPU-ORD")
+                W = w.full()[0]
+                if w.asymmetry(intrinsic=False) == []:
+                    ww = symmetrize(w)
+                    WW = jnp.array(ww.todense())
+                    evals = jnp.linalg.eigh(WW)[0] 
+                else:
+                    W = jnp.array(w.full()[0])
+                    evals = jnp.linalg.eigvals(W)
+                
+                y_jax = jnp.array(self.y)
+                ylag_jax = jnp.array(ylag)
+                x_jax = jnp.array(self.x)
+                xlag_jax = jnp.array(xlag)
+                
+                optimizer = LBFGSB(fun=err_c_loglik_ord_jax)
+                
+                init_lam = jnp.array([0.0])
+                bounds = (jnp.array([-0.999]), jnp.array([0.999]))
+                
+                best_lam_array, state = optimizer.run(
+                    init_lam,
+                    bounds=bounds,
+                    n=self.n,
+                    y=y_jax,
+                    ylag=ylag_jax,
+                    x=x_jax,
+                    xlag=xlag_jax,
+                    evals=evals
+                )
+                
+                res = OptimizeResult(
+                    x=float(best_lam_array[0]),
+                    fun=float(state.value),
+                    success=True,
+                    message="Optimisation successful via JAXopt using ord."
                 )
             elif methodML == "LU":
                 I = sp.identity(w.n, format='csc')
@@ -219,6 +304,26 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
                     method="bounded",
                     tol=epsilon,
                 )
+            elif methodML == "GPU-LU":
+                print("GPU LU")
+                y_cp = cp.array(self.y)
+                ylag_cp = cp.array(ylag)
+                x_cp = cp.array(self.x)
+                xlag_cp = cp.array(xlag)
+
+                I_cp = identity(w.n, format='csc')
+                Wsp_cp = csc_matrix(w.sparse)
+
+                res = minimize_scalar(
+                    err_c_loglik_gpu_lu,
+                    0.0,
+                    bounds=(-1.0, 1.0),
+                    args=(self.n, y_cp, ylag_cp, x_cp, xlag_cp, I_cp, Wsp_cp),
+                    method="bounded",
+                    options={'xatol': epsilon},
+                )
+
+                W = w.sparse.tocsc()
         else:
             raise Exception("{0} is an unsupported method".format(method))
 
@@ -253,19 +358,54 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
 
         varb = self.sig2 * xsxsi
 
-        # variance-covariance matrix lambda, sigma
+        if methodML == "GPU-LU":
+            W_gpu = cpsp.csr_matrix(W)
 
-        a = -self.lam * W
-        spfill_diagonal(a, 1.0)
-        ai = spinv(a)
-        wai = spdot(W, ai)
-        tr1 = wai.diagonal().sum()
+            # Check if we can converge by finding the spectral radius of W
+            x = cp.random.rand(self.n, 1)
+            x = x / cp.linalg.norm(x)
+            for _ in range(30):
+                x_next = cuspdot(W_gpu, x)
+                rho_W = cp.abs(cp.dot(x.T, x_next) / cp.dot(x.T, x))
+                x = x_next / cp.linalg.norm(x_next)
 
-        wai2 = spdot(wai, wai)
-        tr2 = wai2.diagonal().sum()
+            rho_W = float(rho_W[0, 0])
 
-        waiTwai = spdot(wai.T, wai)
-        tr3 = waiTwai.diagonal().sum()
+            if abs(self.lam) * rho_W >= 1.0:
+                raise ValueError(
+                        f"Taylor series will not converge: |lambda| * rho(W) = {abs(self.lam) * rho_W:.4f} >= 1."
+                )
+
+            # Use taylor series expansion
+            wai = W_gpu.copy()
+            current_term = W_gpu.copy()
+            max_iter = 50
+            tolerance = 1e-6
+
+            for k in range(1, max_iter):
+                current_term = cuspdot(current_term, W_gpu) * self.lam
+                wai = wai + current_term
+                if cp.linalg.norm(current_term.diagonal()) < tolerance:
+                    break
+
+            wai2 = cuspdot(wai, wai)
+            waiTwai = cuspdot(wai.T, wai)
+
+            tr1 = float(wai.diagonal().sum())
+            tr2 = float(wai2.diagonal().sum())
+            tr3 = float(waiTwai.diagonal().sum())
+        else:
+            a = -self.lam * W
+            spfill_diagonal(a, 1.0)
+            ai = spinv(a)
+            wai = spdot(W, ai)
+
+            wai2 = spdot(wai, wai)
+            waiTwai = spdot(wai.T, wai)
+
+            tr1 = wai.diagonal().sum()
+            tr2 = wai2.diagonal().sum()
+            tr3 = waiTwai.diagonal().sum()
 
         v1 = np.vstack((tr2 + tr3, tr1 / self.sig2))
         v2 = np.vstack((tr1 / self.sig2, self.n / (2.0 * self.sig2 ** 2)))
@@ -565,7 +705,35 @@ def err_c_loglik(lam, n, y, ylag, x, xlag, W):
     clik = nlsig2 - jacob
     return clik
 
+@jax.jit
+def err_c_loglik_jax(lam, n, y, ylag, x, xlag, W):
+    ys = y - lam * ylag
+    xs = x - lam * xlag
 
+    ysys = jnp.dot(ys.T, ys)
+    xsxs = jnp.dot(xs.T, xs)
+    xsxsi = jnp.linalg.inv(xsxs)
+
+    xsys = jnp.dot(xs.T, ys)
+    x1 = jnp.dot(xsxsi, xsys)
+    x2 = jnp.dot(xsys.T, x1)
+
+    ee = ysys - x2
+    sig2 = ee[0][0] / n
+    nlsig2 = (n / 2.0) * jnp.log(sig2)
+
+    a = -lam * W
+    N = a.shape[0]
+
+    # alternatively: I + a if a has zero diagonal
+    a = a.at[jnp.arange(N), jnp.arange(N)].set(1.0)
+
+    jacob = jnp.log(jnp.linalg.det(a))
+    clik = nlsig2 - jacob
+    return clik
+
+
+@profile
 def err_c_loglik_sp(lam, n, y, ylag, x, xlag, I, Wsp):
     # Standardize lambda to scalar
     if isinstance(lam, np.ndarray):
@@ -633,6 +801,68 @@ def err_c_loglik_ord(lam, n, y, ylag, x, xlag, evals):
     # this is the negative of the concentrated log lik for minimization
     clik = nlsig2 - jacob
     return clik
+@jax.jit
+def err_c_loglik_ord_jax(lam, n, y, ylag, x, xlag, evals):
+    # concentrated log-lik for error model, no constants, eigenvalues
+    ys = y - lam * ylag
+    xs = x - lam * xlag
+
+    ysys = jnp.dot(ys.T, ys)
+    xsxs = jnp.dot(xs.T, xs)
+    xsxsi = jnp.linalg.inv(xsxs)
+
+    xsys = jnp.dot(xs.T, ys)
+    x1 = jnp.dot(xsxsi, xsys)
+    x2 = jnp.dot(xsys.T, x1)
+
+    ee = ysys - x2
+    sig2 = ee[0][0] / n
+    nlsig2 = (n / 2.0) * jnp.log(sig2)
+
+    revals = lam * evals
+
+    jacob = jnp.real(jnp.sum(jnp.log(1.0 - revals)))
+
+    # this is the negative of the concentrated log lik for minimization
+    clik = nlsig2 - jacob
+    return clik
+
+@profile
+def err_c_loglik_gpu_lu(lam, n, y, ylag, x, xlag, I_cp, Wsp_cp):
+    import cupy as cp
+    from cupyx.scipy.sparse.linalg import splu
+
+    if isinstance(lam, cp.ndarray) or isinstance(lam, np.ndarray):
+        lam = lam.item()
+
+    ys = y - lam * ylag
+    xs = x - lam * xlag
+
+    xsxs = cp.dot(xs.T, xs)
+    xsys = cp.dot(xs.T, ys)
+
+    try:
+        betas = cp.linalg.solve(xsxs, xsys)
+    except cp.linalg.LinAlgError:
+        return np.inf
+
+    xb = cp.dot(xs, betas)
+    e = ys - xb
+
+    ee = cp.dot(e.T, e)
+    sig2 = ee.item() / n
+
+    A = I_cp - lam * Wsp_cp
+    try:
+        lu_obj = splu(A.tocsc())
+        jacob = cp.sum(cp.log(cp.abs(lu_obj.U.diagonal())))
+    except RuntimeError:
+        return np.inf
+
+    nlsig2 = (n / 2.0) * cp.log(sig2)
+    clik = nlsig2 - jacob
+
+    return clik.item()
 
 
 def _test():
