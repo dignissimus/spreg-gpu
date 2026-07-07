@@ -18,7 +18,6 @@ from .w_utils import symmetrize
 import pandas as pd
 from .output import output, _nonspat_top
 import cupy as cp
-from line_profiler import profile
 import cupyx.scipy.sparse as cpsp
 
 PRECISION = 100
@@ -289,7 +288,7 @@ class BaseML_Error(RegressionPropsY, RegressionPropsVM, REGI.Regimes_Frame):
 
     """
 
-    @profile
+    # @profile
     def __init__(self, y, x, w, method="full", epsilon=0.0000001, regimes_att=None):
         # set up main regression variables and spatial filters
         self.y = y
@@ -739,7 +738,7 @@ def err_c_loglik(lam, n, y, ylag, x, xlag, W):
     return clik
 
 
-@profile
+# @profile
 def err_c_loglik_sp(lam, n, y, ylag, x, xlag, I, Wsp):
     # Standardize lambda to scalar
     if isinstance(lam, np.ndarray):
